@@ -28,7 +28,7 @@ def run() -> None:
     output_dir: str = CONFIG.get("output_dir")
     device: str = CONFIG.get("device", "cpu")
     dataset_part: str = CONFIG.get("dataset_part")
-    batch_size: int = int(CONFIG.get("batch_size", 8))
+    batch_size: int = int(CONFIG.get("batch_size"))
 
     if not dataset_path:
         raise Exception

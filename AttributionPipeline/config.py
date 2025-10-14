@@ -7,7 +7,8 @@ CONFIG = {
     "dataset_path": "Datasets/Scaffold_datasets/test_datasets/bbbp",
     # Where to write attribution JSON files
     "output_dir": "AttributionPipeline/data/bbbp/integrated_gradients",
-    "device": "mps"
+    "device": "mps",
+    "batch_size": 1
 }
 
 TASKS = {
