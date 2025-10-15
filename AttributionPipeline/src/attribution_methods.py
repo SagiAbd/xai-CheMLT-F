@@ -130,61 +130,86 @@ class AttributionMethod:
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        baselines: Optional[torch.Tensor] = None,
+        baseline_smiles_list: Optional[List[str]] = None,
         n_steps: int = 50,
         normalize: bool = True,
         return_convergence_delta: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Compute token-level attributions using layer-based methods."""
+        """
+        Compute token-level attributions using an ensemble of baselines.
+        Each baseline is a real SMILES string, not [PAD].
+        Special tokens ([CLS], [SEP]) are preserved.
+        """
         self.model.eval()
-
         input_ids = input_ids.to(self.device)
         attention_mask = attention_mask.to(self.device)
 
-        # Create baseline (used for IG and DeepLift)
-        if baselines is None and self.method_name in ["integrated_gradients", "deeplift"]:
-            baselines = torch.zeros_like(input_ids)
-            baselines[:] = self.tokenizer.pad_token_id
+        if baseline_smiles_list is None:
+            baseline_smiles_list = ["C", "O", "CC"]  # simple neutral molecules
 
-        baseline_mask = torch.zeros_like(attention_mask)
-        baselines = baselines.to(self.device)
+        ensemble_attributions = []
+        deltas = []
 
-        # Compute attributions
-        delta = None
-        if isinstance(self.method, LayerIntegratedGradients):
-            attributions, delta = self.method.attribute(
-                inputs=(input_ids, attention_mask),
-                baselines=(baselines, baseline_mask),
-                n_steps=n_steps,
-                return_convergence_delta=True,
-                **kwargs,
+        for ref_smiles in baseline_smiles_list:
+            ref_inputs = self.tokenizer(
+                ref_smiles,
+                return_tensors="pt",
+                max_length=input_ids.shape[1],
+                padding="max_length",
+                truncation=True,
             )
-        elif isinstance(self.method, LayerDeepLift):
-            attributions = self.method.attribute(
-                inputs=(input_ids, attention_mask),
-                baselines=(baselines, baseline_mask),
-                **kwargs,
-            )
-        else:
-            # Gradient-based (LayerGradientXActivation, etc.)
-            attributions = self.method.attribute(
-                inputs=(input_ids, attention_mask),
-                **kwargs,
-            )
+            baseline_ids = ref_inputs["input_ids"].to(self.device)
 
-        # Sum across embedding dimension
-        if attributions.dim() == 3:
-            attributions = attributions.sum(dim=-1)
+            # Preserve special tokens like CLS and SEP 
+            special_tokens = {
+                self.tokenizer.cls_token_id,
+                self.tokenizer.sep_token_id,
+            }
+            # copy special tokens from input_ids to baseline_ids
+            for i in range(baseline_ids.shape[1]):
+                if input_ids[0, i].item() in special_tokens:
+                    baseline_ids[0, i] = input_ids[0, i]
 
-        # Apply mask and normalize
+            baseline_mask = torch.zeros_like(attention_mask)
+
+            # Compute single baseline attribution
+            if isinstance(self.method, LayerIntegratedGradients):
+                attrs, delta = self.method.attribute(
+                    inputs=(input_ids, attention_mask),
+                    baselines=(baseline_ids, baseline_mask),
+                    n_steps=n_steps,
+                    return_convergence_delta=True,
+                    **kwargs,
+                )
+                deltas.append(delta)
+            elif isinstance(self.method, LayerDeepLift):
+                attrs = self.method.attribute(
+                    inputs=(input_ids, attention_mask),
+                    baselines=(baseline_ids, baseline_mask),
+                    **kwargs,
+                )
+            else:
+                attrs = self.method.attribute(
+                    inputs=(input_ids, attention_mask),
+                    **kwargs,
+                )
+
+            if attrs.dim() == 3:
+                attrs = attrs.sum(dim=-1)
+
+            ensemble_attributions.append(attrs.detach().cpu())
+
+        # Average over ensemble baselines
+        attributions = torch.mean(torch.stack(ensemble_attributions), dim=0)
+
+        # Optional normalization
         if normalize:
             attributions = self._normalize(attributions, attention_mask)
 
-        result_attrs = attributions.detach().cpu()
-        if return_convergence_delta and delta is not None:
-            return result_attrs, delta
-        return result_attrs, None
+        delta_mean = torch.mean(torch.stack(deltas), dim=0) if deltas else None
+
+        return attributions, delta_mean
 
     def _normalize(self, attributions: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Normalize attributions per sample (L2 norm, masked)."""
