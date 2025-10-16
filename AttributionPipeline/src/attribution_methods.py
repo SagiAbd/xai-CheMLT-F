@@ -1,12 +1,11 @@
 import torch
 import numpy as np
+import shap
 from typing import Optional, Tuple, List, Dict
 from captum.attr import (
     LayerIntegratedGradients,
     LayerGradientXActivation,
-    LayerDeepLift,
-    LayerGradCam,
-    LayerAttribution,
+    LayerDeepLift
 )
 from AttributionPipeline.src.utils import load_model
 from AttributionPipeline.config import CONFIG, TASKS
@@ -51,8 +50,53 @@ class CheMLTWrapper(torch.nn.Module):
             return logits.squeeze(-1)
 
 
+class CheMLTPipeline:
+    """Pipeline wrapper for SHAP compatibility."""
+    
+    def __init__(self, model, tokenizer, task_index: int, label_index: int = 0, device: str = "cuda"):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.task_index = task_index
+        self.label_index = label_index
+        self.device = device
+        self.wrapper = CheMLTWrapper(model, task_index, label_index)
+        self.task_name, self.num_labels, self.task_type = TASKS[task_index]
+        
+    def __call__(self, smiles_list: List[str]):
+        """
+        SHAP-compatible call method.
+        
+        Args:
+            smiles_list: List of SMILES strings
+            
+        Returns:
+            List of predictions (probabilities or regression values)
+        """
+        if isinstance(smiles_list, str):
+            smiles_list = [smiles_list]
+            
+        results = []
+        for smiles in smiles_list:
+            inputs = self.tokenizer(
+                smiles,
+                return_tensors="pt",
+                max_length=512,
+                padding="max_length",
+                truncation=True,
+            )
+            input_ids = inputs["input_ids"].to(self.device)
+            attention_mask = inputs["attention_mask"].to(self.device)
+            
+            with torch.no_grad():
+                pred = self.wrapper(input_ids, attention_mask).cpu().item()
+            
+            results.append(pred)
+            
+        return np.array(results)
+
+
 class AttributionMethod:
-    """Unified interface for token-level attributions using layer-based Captum methods."""
+    """Unified interface for token-level attributions using layer-based Captum methods and SHAP."""
 
     def __init__(
         self,
@@ -73,23 +117,25 @@ class AttributionMethod:
         self.task_name, self.num_labels, self.task_type = TASKS[task_index]
 
         self.wrapper = CheMLTWrapper(self.model, task_index, label_index)
-        self.embeddings = self.model.encoder1.embeddings
-
-        # Initialize the correct layer-based attribution method
-        self.method = self._init_method()
+        
+        if self.method_name != "shap":
+            self.embeddings = self.model.encoder1.embeddings
+            self.method = self._init_method()
+        else:
+            # Initialize SHAP-specific components
+            self.pipeline = CheMLTPipeline(
+                self.model, self.tokenizer, task_index, label_index, device
+            )
+            self.explainer = None  # Initialized lazily in compute()
 
     def _init_method(self):
         """Initialize layer-based Captum attribution method."""
         if self.method_name in ["integrated_gradients"]:
             return LayerIntegratedGradients(self.wrapper, self.embeddings)
-        elif self.method_name in ["saliency", "input_x_gradient"]:
-            # For these, use LayerGradientXActivation to handle embedding-level gradients
+        elif self.method_name in ["input_x_gradient"]:
             return LayerGradientXActivation(self.wrapper, self.embeddings)
-        elif self.method_name in ["deeplift", "layer_deeplift"]:
+        elif self.method_name in ["deeplift"]:
             return LayerDeepLift(self.wrapper, self.embeddings)
-        elif self.method_name == "gradcam":
-            # Optional example for completeness
-            return LayerGradCam(self.wrapper, self.embeddings)
         else:
             raise ValueError(f"Unknown or unsupported attribution method: {self.method_name}")
 
@@ -137,16 +183,79 @@ class AttributionMethod:
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Compute token-level attributions using an ensemble of baselines.
-        Each baseline is a real SMILES string, not [PAD].
-        Special tokens ([CLS], [SEP]) are preserved.
+        Compute token-level attributions.
+        
+        For SHAP: Uses the SHAP Explainer on the raw SMILES string
+        For Captum methods: Uses ensemble of baselines
+        """
+        if self.method_name == "shap":
+            return self._compute_shap(input_ids, attention_mask, **kwargs)
+        else:
+            return self._compute_captum(
+                input_ids, attention_mask, baseline_smiles_list, 
+                n_steps, normalize, return_convergence_delta, **kwargs
+            )
+
+    def _compute_shap(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        **kwargs
+    ) -> Tuple[torch.Tensor, None]:
+        """Compute SHAP values for token-level attributions."""
+        # Decode input_ids back to SMILES
+        smiles = self.tokenizer.decode(
+            input_ids[0], 
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False
+        )
+        
+        # Initialize explainer if not already done
+        if self.explainer is None:
+            self.explainer = shap.Explainer(self.pipeline, self.tokenizer)
+        
+        # Compute SHAP values
+        shap_values = self.explainer([smiles])
+        
+        # Extract token-level attributions
+        # shap_values.values has shape (1, num_tokens, num_outputs)
+        # For single output, we take [:, :, 0]
+        attributions = torch.tensor(shap_values.values[0, :])
+        
+        # Pad or truncate to match input_ids length
+        seq_len = input_ids.shape[1]
+        if attributions.shape[0] < seq_len:
+            # Pad with zeros
+            padding = torch.zeros(seq_len - attributions.shape[0])
+            attributions = torch.cat([attributions, padding])
+        elif attributions.shape[0] > seq_len:
+            # Truncate
+            attributions = attributions[:seq_len]
+        
+        # Add batch dimension
+        attributions = attributions.unsqueeze(0)
+        
+        return attributions, None
+
+    def _compute_captum(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        baseline_smiles_list: Optional[List[str]] = None,
+        n_steps: int = 50,
+        normalize: bool = True,
+        return_convergence_delta: bool = False,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Compute token-level attributions using Captum methods with ensemble of baselines.
         """
         self.model.eval()
         input_ids = input_ids.to(self.device)
         attention_mask = attention_mask.to(self.device)
 
         if baseline_smiles_list is None:
-            baseline_smiles_list = ["C", "O", "CC"]  # simple neutral molecules
+            baseline_smiles_list = ["C"]  # simple neutral molecule
 
         ensemble_attributions = []
         deltas = []
@@ -198,7 +307,7 @@ class AttributionMethod:
             if attrs.dim() == 3:
                 attrs = attrs.sum(dim=-1)
 
-            ensemble_attributions.append(attrs.detach().cpu())
+            ensemble_attributions.append(attrs.detach())
 
         # Average over ensemble baselines
         attributions = torch.mean(torch.stack(ensemble_attributions), dim=0)
@@ -209,6 +318,8 @@ class AttributionMethod:
 
         delta_mean = torch.mean(torch.stack(deltas), dim=0) if deltas else None
 
+        attributions = attributions.detach().cpu()
+        
         return attributions, delta_mean
 
     def _normalize(self, attributions: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -216,6 +327,29 @@ class AttributionMethod:
         attributions = attributions * mask
         norm = torch.norm(attributions, dim=1, keepdim=True) + 1e-9
         return attributions / norm
+
+    def visualize_shap(self, smiles: str):
+        """
+        Create SHAP text visualization for a SMILES string.
+        
+        Args:
+            smiles: Input SMILES string
+        """
+        if self.method_name != "shap":
+            raise ValueError("visualize_shap() can only be called when method_name='shap'")
+        
+        if self.explainer is None:
+            self.explainer = shap.Explainer(self.pipeline)
+        
+        # Get prediction
+        prediction = self.pipeline([smiles])
+        print(f"Prediction: {prediction[0]:.4f}")
+        
+        # Compute and visualize SHAP values
+        shap_values = self.explainer([smiles])
+        shap.plots.text(shap_values)
+        
+        return shap_values
 
     def get_top_tokens(
         self,
@@ -255,3 +389,39 @@ class AttributionMethod:
         return [
             self.tokenizer.convert_ids_to_tokens(seq.tolist()) for seq in input_ids
         ]
+
+
+# Example usage
+if __name__ == "__main__":
+    # Example with SHAP
+    attributor = AttributionMethod(
+        method_name="shap",
+        task_index=0,
+        label_index=0,
+        device="cuda"
+    )
+    
+    smiles = "CC(=O)OC1=CC=CC=C1C(=O)O"  # Aspirin
+    
+    # Get prediction
+    pred_info = attributor.predict(smiles)
+    print(f"Prediction: {pred_info['pred_label']}")
+    
+    # Compute attributions
+    attributions, _ = attributor.compute(
+        pred_info["input_ids"],
+        pred_info["attention_mask"]
+    )
+    
+    # Get top contributing tokens
+    top_tokens = attributor.get_top_tokens(
+        pred_info["tokens"],
+        attributions[0].numpy(),
+        top_k=5
+    )
+    print("\nTop contributing tokens:")
+    for token, score in top_tokens:
+        print(f"  {token}: {score:.4f}")
+    
+    # Visualize with SHAP
+    attributor.visualize_shap(smiles)

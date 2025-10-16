@@ -1,13 +1,13 @@
 CONFIG = {
     "model_dir": "Weights/Scaffold_CheMLT-F",
-    "method_name": "integrated_gradients",
+    "method_name": "shap",
     "task": 2,
     "dataset_part": "test", # test/train
     # Absolute or relative path to the dataset directory (HuggingFace load_from_disk export)
     "dataset_path": "Datasets/Scaffold_datasets/test_datasets/bbbp",
     # Where to write attribution JSON files
-    "output_dir": "AttributionPipeline/data/bbbp/integrated_gradients",
-    "device": "mps",
+    "output_dir": "AttributionPipeline/data/bbbp/shap",
+    "device": "cuda",
     "batch_size": 1
 }
 
