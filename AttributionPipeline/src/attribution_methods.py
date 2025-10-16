@@ -1,11 +1,13 @@
 import torch
 import numpy as np
 import shap
+from lime.lime_text import LimeTextExplainer
 from typing import Optional, Tuple, List, Dict
 from captum.attr import (
     LayerIntegratedGradients,
     LayerGradientXActivation,
-    LayerDeepLift
+    LayerDeepLift,
+    LayerLRP
 )
 from AttributionPipeline.src.utils import load_model
 from AttributionPipeline.config import CONFIG, TASKS
@@ -64,18 +66,13 @@ class CheMLTPipeline:
         
     def __call__(self, smiles_list: List[str]):
         """
-        SHAP-compatible call method.
-        
-        Args:
-            smiles_list: List of SMILES strings
-            
-        Returns:
-            List of predictions (probabilities or regression values)
+        SHAP/LIME-compatible call method.
+        Returns probabilities for both classes if classification, else regression values.
         """
         if isinstance(smiles_list, str):
             smiles_list = [smiles_list]
-            
-        results = []
+
+        preds = []
         for smiles in smiles_list:
             inputs = self.tokenizer(
                 smiles,
@@ -86,13 +83,25 @@ class CheMLTPipeline:
             )
             input_ids = inputs["input_ids"].to(self.device)
             attention_mask = inputs["attention_mask"].to(self.device)
-            
+
             with torch.no_grad():
                 pred = self.wrapper(input_ids, attention_mask).cpu().item()
-            
-            results.append(pred)
-            
-        return np.array(results)
+
+            preds.append(pred)
+
+        preds = np.array(preds)
+
+        # ✅ Convert scalar outputs to 2D probabilities if classification
+        if self.task_type == "classification":
+            # Ensure preds are between 0 and 1 (they should be sigmoid outputs)
+            preds = np.clip(preds, 0, 1)
+            preds = np.stack([1 - preds, preds], axis=1)  # shape (n, 2)
+        
+        # If regression, just return shape (n, 1)
+        else:
+            preds = preds.reshape(-1, 1)
+
+        return preds
 
 
 class AttributionMethod:
@@ -118,15 +127,22 @@ class AttributionMethod:
 
         self.wrapper = CheMLTWrapper(self.model, task_index, label_index)
         
-        if self.method_name != "shap":
-            self.embeddings = self.model.encoder1.embeddings
-            self.method = self._init_method()
-        else:
-            # Initialize SHAP-specific components
+        if self.method_name == "shap":
+            # SHAP setup
             self.pipeline = CheMLTPipeline(
                 self.model, self.tokenizer, task_index, label_index, device
             )
-            self.explainer = None  # Initialized lazily in compute()
+            self.explainer = None
+        elif self.method_name == "lime":
+            # LIME setup
+            self.pipeline = CheMLTPipeline(
+                self.model, self.tokenizer, task_index, label_index, device
+            )
+            self.explainer = LimeTextExplainer(class_names=["Inactive", "Active"])
+        else:
+            # Captum setup
+            self.embeddings = self.model.encoder1.embeddings
+            self.method = self._init_method()
 
     def _init_method(self):
         """Initialize layer-based Captum attribution method."""
@@ -136,6 +152,9 @@ class AttributionMethod:
             return LayerGradientXActivation(self.wrapper, self.embeddings)
         elif self.method_name in ["deeplift"]:
             return LayerDeepLift(self.wrapper, self.embeddings)
+        elif self.method_name in ["lrp"]:
+            self.embeddings = self.model.encoder1.encoder.layer[-1]
+            return LayerLRP(self.wrapper, self.embeddings)
         else:
             raise ValueError(f"Unknown or unsupported attribution method: {self.method_name}")
 
@@ -181,19 +200,20 @@ class AttributionMethod:
         normalize: bool = True,
         return_convergence_delta: bool = False,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Compute token-level attributions.
-        
-        For SHAP: Uses the SHAP Explainer on the raw SMILES string
-        For Captum methods: Uses ensemble of baselines
-        """
+    ):
         if self.method_name == "shap":
             return self._compute_shap(input_ids, attention_mask, **kwargs)
+        elif self.method_name == "lime":
+            return self._compute_lime(input_ids, attention_mask, **kwargs)
         else:
             return self._compute_captum(
-                input_ids, attention_mask, baseline_smiles_list, 
-                n_steps, normalize, return_convergence_delta, **kwargs
+                input_ids,
+                attention_mask,
+                baseline_smiles_list,
+                n_steps,
+                normalize,
+                return_convergence_delta,
+                **kwargs,
             )
 
     def _compute_shap(
@@ -235,6 +255,62 @@ class AttributionMethod:
         # Add batch dimension
         attributions = attributions.unsqueeze(0)
         
+        return attributions, None
+
+    def _compute_lime(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        num_features: int = 20,
+        num_samples: int = 2000,
+        **kwargs,
+    ):
+        """Compute LIME token-level attributions for a SMILES string."""
+
+        # Decode SMILES back from input IDs
+        smiles = self.tokenizer.decode(
+            input_ids[0],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False
+        )
+
+        # Tokenize with *your model tokenizer* (same as model)
+        tokens = self.tokenizer.tokenize(smiles)
+
+        # Define a custom split_expression so that LIME perturbs using your token boundaries
+        split_func = lambda s: self.tokenizer.tokenize(s)
+
+        # Initialize LIME explainer (reuse or rebuild with proper split_expression)
+        self.explainer = LimeTextExplainer(
+            split_expression=split_func,
+            class_names=["Inactive", "Active"]
+        )
+
+        # Run LIME on the text formed by joined tokens
+        exp = self.explainer.explain_instance(
+            " ".join(tokens),     # pass tokenized version
+            self.pipeline,
+            num_features=num_features,
+            num_samples=num_samples
+        )
+
+        # Convert feature weights into dict
+        feature_weights = dict(exp.as_list())
+
+        # Map back to the model's tokens
+        attributions = torch.tensor(
+            [feature_weights.get(tok, 0.0) for tok in tokens]
+        )
+
+        # Pad/truncate to input length
+        seq_len = input_ids.shape[1]
+        if attributions.shape[0] < seq_len:
+            padding = torch.zeros(seq_len - attributions.shape[0])
+            attributions = torch.cat([attributions, padding])
+        elif attributions.shape[0] > seq_len:
+            attributions = attributions[:seq_len]
+
+        attributions = attributions.unsqueeze(0)
         return attributions, None
 
     def _compute_captum(
@@ -389,39 +465,3 @@ class AttributionMethod:
         return [
             self.tokenizer.convert_ids_to_tokens(seq.tolist()) for seq in input_ids
         ]
-
-
-# Example usage
-if __name__ == "__main__":
-    # Example with SHAP
-    attributor = AttributionMethod(
-        method_name="shap",
-        task_index=0,
-        label_index=0,
-        device="cuda"
-    )
-    
-    smiles = "CC(=O)OC1=CC=CC=C1C(=O)O"  # Aspirin
-    
-    # Get prediction
-    pred_info = attributor.predict(smiles)
-    print(f"Prediction: {pred_info['pred_label']}")
-    
-    # Compute attributions
-    attributions, _ = attributor.compute(
-        pred_info["input_ids"],
-        pred_info["attention_mask"]
-    )
-    
-    # Get top contributing tokens
-    top_tokens = attributor.get_top_tokens(
-        pred_info["tokens"],
-        attributions[0].numpy(),
-        top_k=5
-    )
-    print("\nTop contributing tokens:")
-    for token, score in top_tokens:
-        print(f"  {token}: {score:.4f}")
-    
-    # Visualize with SHAP
-    attributor.visualize_shap(smiles)
