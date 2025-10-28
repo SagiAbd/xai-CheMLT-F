@@ -137,10 +137,6 @@ class DebertaMultiTaskModel(DebertaPreTrainedModel):
         logits_list = self.classification_heads[task_index](combined_output)
         #logits_list = [head(combined_output) for head in self.classification_heads]
 
-        # Return output
-        if not return_dict:
-            return logits_list if not losses else (sum(losses), logits_list)
-
         return {
             #"extra_loss" : combined_loss,
             "logits": logits_list,

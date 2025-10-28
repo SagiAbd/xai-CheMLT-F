@@ -1,8 +1,7 @@
 import torch
 import numpy as np
 import shap
-from lime.lime_text import LimeTextExplainer
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Any
 from captum.attr import (
     LayerIntegratedGradients,
     LayerGradientXActivation,
@@ -55,7 +54,7 @@ class CheMLTWrapper(torch.nn.Module):
 class CheMLTPipeline:
     """Pipeline wrapper for SHAP compatibility."""
     
-    def __init__(self, model, tokenizer, task_index: int, label_index: int = 0, device: str = "cuda"):
+    def __init__(self, model, tokenizer, task_index: int, label_index: int = 0, device: str = "cpu"):
         self.model = model
         self.tokenizer = tokenizer
         self.task_index = task_index
@@ -66,7 +65,7 @@ class CheMLTPipeline:
         
     def __call__(self, smiles_list: List[str]):
         """
-        SHAP/LIME-compatible call method.
+        SHAP-compatible call method.
         Returns probabilities for both classes if classification, else regression values.
         """
         if isinstance(smiles_list, str):
@@ -91,7 +90,7 @@ class CheMLTPipeline:
 
         preds = np.array(preds)
 
-        # ✅ Convert scalar outputs to 2D probabilities if classification
+        # Convert scalar outputs to 2D probabilities if classification
         if self.task_type == "classification":
             # Ensure preds are between 0 and 1 (they should be sigmoid outputs)
             preds = np.clip(preds, 0, 1)
@@ -133,12 +132,6 @@ class AttributionMethod:
                 self.model, self.tokenizer, task_index, label_index, device
             )
             self.explainer = None
-        elif self.method_name == "lime":
-            # LIME setup
-            self.pipeline = CheMLTPipeline(
-                self.model, self.tokenizer, task_index, label_index, device
-            )
-            self.explainer = LimeTextExplainer(class_names=["Inactive", "Active"])
         else:
             # Captum setup
             self.embeddings = self.model.encoder1.embeddings
@@ -158,7 +151,7 @@ class AttributionMethod:
         else:
             raise ValueError(f"Unknown or unsupported attribution method: {self.method_name}")
 
-    def predict(self, smiles: str, max_length: int = 512) -> Dict[str, any]:
+    def predict(self, smiles: str, max_length: int = 512) -> Dict[str, Any]:
         """Tokenize SMILES and get model prediction."""
         inputs = self.tokenizer(
             smiles,
@@ -195,21 +188,17 @@ class AttributionMethod:
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        baseline_smiles_list: Optional[List[str]] = None,
         n_steps: int = 50,
-        normalize: bool = True,
+        normalize: bool = False,
         return_convergence_delta: bool = False,
         **kwargs,
     ):
         if self.method_name == "shap":
             return self._compute_shap(input_ids, attention_mask, **kwargs)
-        elif self.method_name == "lime":
-            return self._compute_lime(input_ids, attention_mask, **kwargs)
         else:
             return self._compute_captum(
                 input_ids,
                 attention_mask,
-                baseline_smiles_list,
                 n_steps,
                 normalize,
                 return_convergence_delta,
@@ -237,170 +226,105 @@ class AttributionMethod:
         # Compute SHAP values
         shap_values = self.explainer([smiles])
         
-        # Extract token-level attributions
-        # shap_values.values has shape (1, num_tokens, num_outputs)
-        # For single output, we take [:, :, 0]
-        attributions = torch.tensor(shap_values.values[0, :])
+        # Extract token-level attributions for the correct output
+        if self.task_type == "classification":
+            # For binary classification, attributions for positive class (index 1)
+            attributions = torch.tensor(shap_values.values[0, :, 1], dtype=torch.float32)
+        else:
+            # For regression, single output (index 0)
+            attributions = torch.tensor(shap_values.values[0, :, 0], dtype=torch.float32)
         
         # Pad or truncate to match input_ids length
         seq_len = input_ids.shape[1]
         if attributions.shape[0] < seq_len:
-            # Pad with zeros
-            padding = torch.zeros(seq_len - attributions.shape[0])
-            attributions = torch.cat([attributions, padding])
-        elif attributions.shape[0] > seq_len:
-            # Truncate
-            attributions = attributions[:seq_len]
-        
-        # Add batch dimension
-        attributions = attributions.unsqueeze(0)
-        
-        return attributions, None
-
-    def _compute_lime(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        num_features: int = 20,
-        num_samples: int = 2000,
-        **kwargs,
-    ):
-        """Compute LIME token-level attributions for a SMILES string."""
-
-        # Decode SMILES back from input IDs
-        smiles = self.tokenizer.decode(
-            input_ids[0],
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False
-        )
-
-        # Tokenize with *your model tokenizer* (same as model)
-        tokens = self.tokenizer.tokenize(smiles)
-
-        # Define a custom split_expression so that LIME perturbs using your token boundaries
-        split_func = lambda s: self.tokenizer.tokenize(s)
-
-        # Initialize LIME explainer (reuse or rebuild with proper split_expression)
-        self.explainer = LimeTextExplainer(
-            split_expression=split_func,
-            class_names=["Inactive", "Active"]
-        )
-
-        # Run LIME on the text formed by joined tokens
-        exp = self.explainer.explain_instance(
-            " ".join(tokens),     # pass tokenized version
-            self.pipeline,
-            num_features=num_features,
-            num_samples=num_samples
-        )
-
-        # Convert feature weights into dict
-        feature_weights = dict(exp.as_list())
-
-        # Map back to the model's tokens
-        attributions = torch.tensor(
-            [feature_weights.get(tok, 0.0) for tok in tokens]
-        )
-
-        # Pad/truncate to input length
-        seq_len = input_ids.shape[1]
-        if attributions.shape[0] < seq_len:
-            padding = torch.zeros(seq_len - attributions.shape[0])
+            padding = torch.zeros(seq_len - attributions.shape[0], dtype=torch.float32)
             attributions = torch.cat([attributions, padding])
         elif attributions.shape[0] > seq_len:
             attributions = attributions[:seq_len]
-
-        attributions = attributions.unsqueeze(0)
+        
+        # Add batch dimension and move to correct device
+        attributions = attributions.unsqueeze(0).to(self.device)
+        
         return attributions, None
 
     def _compute_captum(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        baseline_smiles_list: Optional[List[str]] = None,
         n_steps: int = 50,
-        normalize: bool = True,
+        normalize: bool = False,
         return_convergence_delta: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Compute token-level attributions using Captum methods with ensemble of baselines.
+        Compute token-level attributions using Captum methods with a single baseline ("C").
         """
         self.model.eval()
         input_ids = input_ids.to(self.device)
         attention_mask = attention_mask.to(self.device)
 
-        if baseline_smiles_list is None:
-            baseline_smiles_list = ["C"]  # simple neutral molecule
+        # Use a single simple baseline
+        ref_smiles = "C"
+        ref_inputs = self.tokenizer(
+            ref_smiles,
+            return_tensors="pt",
+            max_length=input_ids.shape[1],
+            padding="max_length",
+            truncation=True,
+        )
+        baseline_ids = ref_inputs["input_ids"].to(self.device)
 
-        ensemble_attributions = []
-        deltas = []
+        # Preserve special tokens like CLS and SEP
+        special_tokens = {
+            self.tokenizer.cls_token_id,
+            self.tokenizer.sep_token_id,
+        }
+        for i in range(baseline_ids.shape[1]):
+            if input_ids[0, i].item() in special_tokens:
+                baseline_ids[0, i] = input_ids[0, i]
 
-        for ref_smiles in baseline_smiles_list:
-            ref_inputs = self.tokenizer(
-                ref_smiles,
-                return_tensors="pt",
-                max_length=input_ids.shape[1],
-                padding="max_length",
-                truncation=True,
+        # Create proper baseline mask (attend to non-padding tokens)
+        baseline_mask = (baseline_ids != self.tokenizer.pad_token_id).long().to(self.device)
+
+        # Compute attributions
+        if isinstance(self.method, LayerIntegratedGradients):
+            attrs, delta = self.method.attribute(
+                inputs=(input_ids, attention_mask),
+                baselines=(baseline_ids, baseline_mask),
+                n_steps=n_steps,
+                return_convergence_delta=True,
+                **kwargs,
             )
-            baseline_ids = ref_inputs["input_ids"].to(self.device)
+        elif isinstance(self.method, LayerDeepLift):
+            attrs = self.method.attribute(
+                inputs=(input_ids, attention_mask),
+                baselines=(baseline_ids, baseline_mask),
+                **kwargs,
+            )
+            delta = None
+        else:
+            attrs = self.method.attribute(
+                inputs=(input_ids, attention_mask),
+                **kwargs,
+            )
+            delta = None
 
-            # Preserve special tokens like CLS and SEP 
-            special_tokens = {
-                self.tokenizer.cls_token_id,
-                self.tokenizer.sep_token_id,
-            }
-            # copy special tokens from input_ids to baseline_ids
-            for i in range(baseline_ids.shape[1]):
-                if input_ids[0, i].item() in special_tokens:
-                    baseline_ids[0, i] = input_ids[0, i]
-
-            baseline_mask = torch.zeros_like(attention_mask)
-
-            # Compute single baseline attribution
-            if isinstance(self.method, LayerIntegratedGradients):
-                attrs, delta = self.method.attribute(
-                    inputs=(input_ids, attention_mask),
-                    baselines=(baseline_ids, baseline_mask),
-                    n_steps=n_steps,
-                    return_convergence_delta=True,
-                    **kwargs,
-                )
-                deltas.append(delta)
-            elif isinstance(self.method, LayerDeepLift):
-                attrs = self.method.attribute(
-                    inputs=(input_ids, attention_mask),
-                    baselines=(baseline_ids, baseline_mask),
-                    **kwargs,
-                )
-            else:
-                attrs = self.method.attribute(
-                    inputs=(input_ids, attention_mask),
-                    **kwargs,
-                )
-
-            if attrs.dim() == 3:
-                attrs = attrs.sum(dim=-1)
-
-            ensemble_attributions.append(attrs.detach())
-
-        # Average over ensemble baselines
-        attributions = torch.mean(torch.stack(ensemble_attributions), dim=0)
+        # If the attribution has embedding dimension, sum over it
+        if attrs.dim() == 3:
+            attrs = attrs.sum(dim=-1)
 
         # Optional normalization
         if normalize:
-            attributions = self._normalize(attributions, attention_mask)
+            attrs = self._normalize(attrs, attention_mask)
 
-        delta_mean = torch.mean(torch.stack(deltas), dim=0) if deltas else None
+        attrs = attrs.detach().cpu()
+        delta = delta.detach().cpu() if delta is not None else None
 
-        attributions = attributions.detach().cpu()
-        
-        return attributions, delta_mean
+        return attrs, delta
 
     def _normalize(self, attributions: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """Normalize attributions per sample (L2 norm, masked)."""
-        attributions = attributions * mask
+        attributions = attributions * mask.float()
         norm = torch.norm(attributions, dim=1, keepdim=True) + 1e-9
         return attributions / norm
 
@@ -415,11 +339,11 @@ class AttributionMethod:
             raise ValueError("visualize_shap() can only be called when method_name='shap'")
         
         if self.explainer is None:
-            self.explainer = shap.Explainer(self.pipeline)
+            self.explainer = shap.Explainer(self.pipeline, self.tokenizer)
         
         # Get prediction
         prediction = self.pipeline([smiles])
-        print(f"Prediction: {prediction[0]:.4f}")
+        print(f"Prediction: {prediction[0]}")
         
         # Compute and visualize SHAP values
         shap_values = self.explainer([smiles])
@@ -427,20 +351,14 @@ class AttributionMethod:
         
         return shap_values
 
-    def get_top_tokens(
-        self,
-        tokens: List[str],
-        attributions: np.ndarray,
-        top_k: int = 5,
-        include_special: bool = False,
-    ) -> List[Tuple[str, float]]:
-        """Return the most important tokens."""
+    def get_top_tokens(self, tokens, attributions, top_k=5, include_special=False):
+        """Get top-k tokens by attribution magnitude."""
+        attributions = np.array(attributions).flatten()
+
         if not include_special:
             valid_indices = [
-                i
-                for i, token in enumerate(tokens)
-                if token
-                not in [
+                i for i, token in enumerate(tokens)
+                if token not in [
                     self.tokenizer.pad_token,
                     self.tokenizer.cls_token,
                     self.tokenizer.sep_token,
@@ -448,20 +366,21 @@ class AttributionMethod:
             ]
         else:
             valid_indices = [
-                i for i, token in enumerate(tokens) if token != self.tokenizer.pad_token
+                i for i, token in enumerate(tokens)
+                if token != self.tokenizer.pad_token
             ]
 
         valid_tokens = [tokens[i] for i in valid_indices]
         valid_attrs = attributions[valid_indices]
-        sorted_indices = np.argsort(np.abs(valid_attrs))[::-1]
 
-        return [
-            (valid_tokens[i], float(valid_attrs[i]))
-            for i in sorted_indices[:top_k]
-        ]
+        sorted_indices = np.argsort(np.abs(valid_attrs))[::-1]
+        top_tokens = [(valid_tokens[i], float(valid_attrs[i])) for i in sorted_indices[:top_k]]
+
+        return top_tokens
 
     def decode_tokens(self, input_ids: torch.Tensor) -> List[List[str]]:
         """Decode token IDs into readable tokens."""
         return [
             self.tokenizer.convert_ids_to_tokens(seq.tolist()) for seq in input_ids
         ]
+        
