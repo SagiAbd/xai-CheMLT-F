@@ -191,10 +191,11 @@ class AttributionMethod:
         n_steps: int = 50,
         normalize: bool = False,
         return_convergence_delta: bool = False,
+        skip_special_tokens: bool = True,
         **kwargs,
     ):
         if self.method_name == "shap":
-            return self._compute_shap(input_ids, attention_mask, **kwargs)
+            return self._compute_shap(input_ids, attention_mask, skip_special_tokens=skip_special_tokens, **kwargs)
         else:
             return self._compute_captum(
                 input_ids,
@@ -202,6 +203,7 @@ class AttributionMethod:
                 n_steps,
                 normalize,
                 return_convergence_delta,
+                skip_special_tokens=skip_special_tokens,
                 **kwargs,
             )
 
@@ -209,13 +211,14 @@ class AttributionMethod:
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        skip_special_tokens: bool,
         **kwargs
     ) -> Tuple[torch.Tensor, None]:
         """Compute SHAP values for token-level attributions."""
         # Decode input_ids back to SMILES
         smiles = self.tokenizer.decode(
             input_ids[0], 
-            skip_special_tokens=False,
+            skip_special_tokens=skip_special_tokens,
             clean_up_tokenization_spaces=False
         )
         
@@ -254,6 +257,7 @@ class AttributionMethod:
         n_steps: int = 50,
         normalize: bool = False,
         return_convergence_delta: bool = False,
+        skip_special_tokens: bool = True,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -274,14 +278,15 @@ class AttributionMethod:
         )
         baseline_ids = ref_inputs["input_ids"].to(self.device)
 
-        # Preserve special tokens like CLS and SEP
-        special_tokens = {
-            self.tokenizer.cls_token_id,
-            self.tokenizer.sep_token_id,
-        }
-        for i in range(baseline_ids.shape[1]):
-            if input_ids[0, i].item() in special_tokens:
-                baseline_ids[0, i] = input_ids[0, i]
+        if not skip_special_tokens:
+            # Preserve special tokens like CLS and SEP
+            special_tokens = {
+                self.tokenizer.cls_token_id,
+                self.tokenizer.sep_token_id,
+            }
+            for i in range(baseline_ids.shape[1]):
+                if input_ids[0, i].item() in special_tokens:
+                    baseline_ids[0, i] = input_ids[0, i]
 
         # Create proper baseline mask (attend to non-padding tokens)
         baseline_mask = (baseline_ids != self.tokenizer.pad_token_id).long().to(self.device)
