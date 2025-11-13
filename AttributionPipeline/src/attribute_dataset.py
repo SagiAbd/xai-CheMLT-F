@@ -15,9 +15,12 @@ def _ensure_dir(path: str) -> None:
     if not os.path.isdir(path):
         os.makedirs(path, exist_ok=True)
 
-
 def _extract_labels(raw_labels) -> np.ndarray:
-    return np.array([x[0] if isinstance(x, list) else x for x in raw_labels]).astype(float)
+    """
+    Convert dataset labels to a NumPy array, preserving all label columns.
+    Returns shape (N,) for single-label or (N, num_labels) for multi-label tasks.
+    """
+    return np.array(raw_labels)
 
 #
 # Split a SMILES token into units while preserving common two-character atoms.
@@ -53,6 +56,7 @@ def _split_smiles_preserving_atoms(token: str) -> List[str]:
 
 
 def run() -> None:
+    label_index: int = 0
     method_name: str = CONFIG.get("method_name")
     task_index: int = int(CONFIG.get("task"))
     dataset_path: str = CONFIG.get("dataset_path")
@@ -68,11 +72,13 @@ def run() -> None:
     ds = load_from_disk(dataset_path)
 
     labels = _extract_labels(ds["labels"]) if "labels" in ds.column_names else None
+    if task_index == 3:
+        label_index = 1
 
     attr = AttributionMethod(
         method_name=method_name,
         task_index=task_index,
-        label_index=0,
+        label_index=label_index,
         model_dir=CONFIG.get("model_dir"),
         device=device,
     )
@@ -171,10 +177,8 @@ def run() -> None:
 
                 label_value = None
                 if labels is not None:
-                    try:
-                        label_value = int(labels[start + bi])
-                    except Exception:
-                        label_value = float(labels[start + bi])
+                    # pick only the label of interest, e.g., for ClinTox CT_TOX
+                    label_value = float(labels[start + bi][label_index])
 
                 record = {
                     "string": smiles,
