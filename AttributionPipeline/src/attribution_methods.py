@@ -189,7 +189,6 @@ class AttributionMethod:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         n_steps: int = 50,
-        normalize: bool = False,
         return_convergence_delta: bool = False,
         skip_special_tokens: bool = True,
         **kwargs,
@@ -201,7 +200,6 @@ class AttributionMethod:
                 input_ids,
                 attention_mask,
                 n_steps,
-                normalize,
                 return_convergence_delta,
                 skip_special_tokens=skip_special_tokens,
                 **kwargs,
@@ -255,7 +253,6 @@ class AttributionMethod:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         n_steps: int = 50,
-        normalize: bool = False,
         return_convergence_delta: bool = False,
         skip_special_tokens: bool = True,
         **kwargs,
@@ -318,20 +315,7 @@ class AttributionMethod:
         if attrs.dim() == 3:
             attrs = attrs.sum(dim=-1)
 
-        # Optional normalization
-        if normalize:
-            attrs = self._normalize(attrs, attention_mask)
 
-        attrs = attrs.detach().cpu()
-        delta = delta.detach().cpu() if delta is not None else None
-
-        return attrs, delta
-
-    def _normalize(self, attributions: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Normalize attributions per sample (L2 norm, masked)."""
-        attributions = attributions * mask.float()
-        norm = torch.norm(attributions, dim=1, keepdim=True) + 1e-9
-        return attributions / norm
 
     def visualize_shap(self, smiles: str):
         """

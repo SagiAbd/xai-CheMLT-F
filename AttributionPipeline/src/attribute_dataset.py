@@ -115,7 +115,6 @@ def run() -> None:
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 n_steps=50,
-                normalize=True,
                 skip_special_tokens=True,
             )
 

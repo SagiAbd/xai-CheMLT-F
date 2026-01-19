@@ -5,3 +5,4 @@ __pycache__/
 
 AttributionPipeline/data/
 .ipynb_checkpoints/
+*.json
