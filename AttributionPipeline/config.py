@@ -1,12 +1,12 @@
 CONFIG = {
     "model_dir": "Weights/Scaffold_CheMLT-F",
-    "method_name": "input_x_gradient",
-    "task": 3,
+    "method_name": "integrated_gradients",
+    "task": 2,
     "dataset_part": "train", # test/train
     # Absolute or relative path to the dataset directory (HuggingFace load_from_disk export)
-    "dataset_path": "Datasets/Scaffold_datasets/train_datasets/clintox",
+    "dataset_path": "Datasets/Scaffold_datasets/train_datasets/bbbp",
     # Where to write attribution JSON files
-    "output_dir": "AttributionPipeline/data/clintox/input_x_gradient",
+    "output_dir": "AttributionPipeline/data/bbbp/integrated_gradients",
     "device": "mps",
     "batch_size": 1
 }

@@ -315,6 +315,11 @@ class AttributionMethod:
         if attrs.dim() == 3:
             attrs = attrs.sum(dim=-1)
 
+        attrs = attrs.detach().cpu()
+        delta = delta.detach().cpu() if delta is not None else None
+
+        return attrs, delta
+
 
 
     def visualize_shap(self, smiles: str):
